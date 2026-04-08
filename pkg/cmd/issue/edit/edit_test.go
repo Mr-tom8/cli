@@ -414,7 +414,7 @@ func Test_editRun(t *testing.T) {
 		httpStubs func(*testing.T, *httpmock.Registry)
 		stdout    string
 		stderr    string
-		wantErr   bool
+		wantErr   string
 	}{
 		{
 			name: "non-interactive",
@@ -574,7 +574,7 @@ func Test_editRun(t *testing.T) {
 						] }`),
 				)
 			},
-			wantErr: true,
+			wantErr: "*",
 		},
 		{
 			name: "non-interactive multiple issues with update failures",
@@ -644,7 +644,7 @@ func Test_editRun(t *testing.T) {
 				https://github.com/OWNER/REPO/issue/123
 			`),
 			stderr:  `failed to update https://github.com/OWNER/REPO/issue/456:.*test error`,
-			wantErr: true,
+			wantErr: "*",
 		},
 		{
 			name: "interactive",
@@ -720,6 +720,24 @@ func Test_editRun(t *testing.T) {
 				)
 			},
 			stdout: "https://github.com/OWNER/REPO/issue/123\n",
+		},
+		{
+			name: "editor mode empty title",
+			input: &EditOptions{
+				Detector:     &fd.EnabledDetectorMock{},
+				IssueNumbers: []int{123},
+				EditorMode:   true,
+				TitledEditSurvey: func(title, body string) (string, string, error) {
+					return "", "", nil
+				},
+				FetchOptions: func(client *api.Client, repo ghrepo.Interface, editable *prShared.Editable, v1 gh.ProjectsV1Support) error {
+					return nil
+				},
+			},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockIssueGet(t, reg)
+			},
+			wantErr: "title can't be blank",
 		},
 		{
 			name: "interactive prompts with actor assignee display names when actors available",
@@ -847,8 +865,11 @@ func Test_editRun(t *testing.T) {
 			tt.input.BaseRepo = baseRepo
 
 			err := editRun(tt.input)
-			if tt.wantErr {
-				assert.Error(t, err)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				if tt.wantErr != "*" {
+					assert.Contains(t, err.Error(), tt.wantErr)
+				}
 			} else {
 				assert.NoError(t, err)
 			}
