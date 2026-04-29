@@ -123,6 +123,11 @@ func (c cfg) ActiveToken(hostname string) (string, string) {
 	return c.token, "oauth_token"
 }
 
+func (c cfg) ActiveTokenWithError(hostname string) (string, string, error) {
+	token, source := c.ActiveToken(hostname)
+	return token, source, nil
+}
+
 func getViewer(httpClient *http.Client, hostname, token string) (string, error) {
 	authedClient := *httpClient
 	authedClient.Transport = api.AddAuthTokenHeader(httpClient.Transport, cfg{token: token})

@@ -234,29 +234,85 @@ type AuthConfig struct {
 // ActiveToken will retrieve the active auth token for the given hostname,
 // searching environment variables, plain text config, and
 // lastly encrypted storage.
+//
+// Errors encountered while resolving the token (notably keyring access
+// failures such as timeouts on macOS Keychain) are discarded so this
+// method's signature stays unchanged for existing callers. Code that
+// needs to distinguish "no token here" from "token resolution failed"
+// should use ActiveTokenWithError instead.
 func (c *AuthConfig) ActiveToken(hostname string) (string, string) {
+	token, source, _ := c.ActiveTokenWithError(hostname)
+	return token, source
+}
+
+// ActiveTokenWithError is like ActiveToken but additionally returns any
+// error encountered while resolving the active token. The most important
+// case is a keyring access failure (e.g. *keyring.TimeoutError): callers
+// that receive a non-nil error should treat it as a real auth-resolution
+// failure rather than silently proceeding without a token.
+//
+// A non-nil error is returned only when a keyring lookup fails with an
+// error other than keyring.ErrNotFound. ErrNotFound is the legitimate
+// "no token here" signal and is not surfaced as an error so that
+// genuinely anonymous requests against unconfigured hosts keep working.
+func (c *AuthConfig) ActiveTokenWithError(hostname string) (string, string, error) {
 	if c.tokenOverride != nil {
-		return c.tokenOverride(hostname)
+		token, source := c.tokenOverride(hostname)
+		return token, source, nil
 	}
 	token, source := ghauth.TokenFromEnvOrConfig(hostname)
-	if token == "" {
-		var user string
-		var err error
-		if user, err = c.ActiveUser(hostname); err == nil {
-			token, err = c.TokenFromKeyringForUser(hostname, user)
-		}
-		if err != nil {
-			// We should generally be able to find a token for the active user,
-			// but in some cases such as if the keyring was set up in a very old
-			// version of the CLI, it may only have a unkeyed token, so fallback
-			// to it.
-			token, err = c.TokenFromKeyring(hostname)
-		}
-		if err == nil {
-			source = "keyring"
+	if token != "" {
+		return token, source, nil
+	}
+
+	var user string
+	var err error
+	var primaryKeyringErr error
+	if user, err = c.ActiveUser(hostname); err == nil {
+		// Invariant: user is non-empty here, so TokenFromKeyringForUser
+		// will not return its "username cannot be blank" sentinel and any
+		// error we observe is a real keyring access result.
+		token, err = c.TokenFromKeyringForUser(hostname, user)
+		// Stash a real keyring access failure from the user-scoped lookup
+		// so the fallback below can't mask it by reporting its own
+		// ErrNotFound. We deliberately scope this to errors from the
+		// keyring call, since errors from ActiveUser are config-lookup
+		// failures rather than keyring-access failures: when ActiveUser
+		// errors (host has no configured user), falling through to the
+		// legacy unkeyed lookup and returning anonymous on its ErrNotFound
+		// is the historical, intended behavior for unconfigured hosts.
+		if err != nil && !errors.Is(err, keyring.ErrNotFound) {
+			primaryKeyringErr = err
 		}
 	}
-	return token, source
+	if err != nil {
+		// We should generally be able to find a token for the active user,
+		// but in some cases such as if the keyring was set up in a very old
+		// version of the CLI, it may only have a unkeyed token, so fallback
+		// to it.
+		token, err = c.TokenFromKeyring(hostname)
+	}
+	if err == nil {
+		source = "keyring"
+		return token, source, nil
+	}
+	if primaryKeyringErr != nil && errors.Is(err, keyring.ErrNotFound) {
+		// The legacy unkeyed lookup didn't recover a token, so the real
+		// failure to surface is the user-scoped one. Otherwise we'd treat
+		// a timeout or permission error as "no token here" and silently
+		// drop to anonymous requests.
+		err = primaryKeyringErr
+	}
+	if errors.Is(err, keyring.ErrNotFound) {
+		// No token configured for this host. Preserve the historical
+		// "return empty without error" behavior so callers can choose to
+		// proceed anonymously when appropriate.
+		return token, source, nil
+	}
+	// A real keyring access failure (timeout, permission denied, etc.).
+	// Surface it so the request layer can fail loudly instead of silently
+	// sending unauthenticated requests.
+	return token, source, fmt.Errorf("couldn't resolve auth token from keyring for %q: %w", hostname, err)
 }
 
 // HasActiveToken returns true when a token for the hostname is present.

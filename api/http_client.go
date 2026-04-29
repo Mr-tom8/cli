@@ -15,6 +15,7 @@ import (
 
 type tokenGetter interface {
 	ActiveToken(string) (string, string)
+	ActiveTokenWithError(string) (string, string, error)
 }
 
 type HTTPClientOptions struct {
@@ -105,6 +106,11 @@ func AddCacheTTLHeader(rt http.RoundTripper, ttl time.Duration) http.RoundTrippe
 }
 
 // AddAuthTokenHeader adds an authentication token header for the host specified by the request.
+//
+// If the cfg's token resolution returns a non-nil error (typically a keyring access failure such as
+// a macOS Keychain timeout), the request is failed with that error rather than sent unauthenticated;
+// silently dropping the auth header would surface as a confusing upstream 401/403 instead of pointing
+// at the local-keyring root cause.
 func AddAuthTokenHeader(rt http.RoundTripper, cfg tokenGetter) http.RoundTripper {
 	return &funcTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
 		// If the header is already set in the request, don't overwrite it.
@@ -117,7 +123,11 @@ func AddAuthTokenHeader(rt http.RoundTripper, cfg tokenGetter) http.RoundTripper
 			// If the host has changed during a redirect do not add the authentication token header.
 			if !redirectHostnameChange {
 				hostname := ghauth.NormalizeHostname(getHost(req))
-				if token, _ := cfg.ActiveToken(hostname); token != "" {
+				token, _, err := cfg.ActiveTokenWithError(hostname)
+				if err != nil {
+					return nil, err
+				}
+				if token != "" {
 					req.Header.Set(authorization, fmt.Sprintf("token %s", token))
 				}
 			}
