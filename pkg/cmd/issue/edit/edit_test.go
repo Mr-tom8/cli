@@ -10,7 +10,9 @@ import (
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/config"
 	fd "github.com/cli/cli/v2/internal/featuredetection"
+	"github.com/cli/cli/v2/internal/gh"
 	"github.com/cli/cli/v2/internal/ghrepo"
 	"github.com/cli/cli/v2/internal/run"
 	prShared "github.com/cli/cli/v2/pkg/cmd/pr/shared"
@@ -34,6 +36,7 @@ func TestNewCmdEdit(t *testing.T) {
 		output           EditOptions
 		expectedBaseRepo ghrepo.Interface
 		wantsErr         bool
+		config           func() (gh.Config, error)
 	}{
 		{
 			name:     "no argument",
@@ -281,6 +284,84 @@ func TestNewCmdEdit(t *testing.T) {
 			input:    "23 34",
 			wantsErr: true,
 		},
+		{
+			name:  "editor flag",
+			input: "23 --editor",
+			output: EditOptions{
+				IssueNumbers: []int{23},
+				EditorMode:   true,
+			},
+			wantsErr: false,
+		},
+		{
+			name:     "editor flag with body flag",
+			input:    "23 --editor --body test",
+			wantsErr: true,
+		},
+		{
+			name:     "editor flag with body-file flag",
+			input:    fmt.Sprintf("23 --editor --body-file '%s'", tmpFile),
+			wantsErr: true,
+		},
+		{
+			name:     "editor flag with multiple issues",
+			input:    "23 34 --editor",
+			wantsErr: true,
+		},
+		{
+			name:  "prefer_editor_prompt config with body flag",
+			input: "23 --body test",
+			config: func() (gh.Config, error) {
+				return config.NewFromString("prefer_editor_prompt: enabled"), nil
+			},
+			output: EditOptions{
+				IssueNumbers: []int{23},
+				EditorMode:   false,
+				Editable: prShared.Editable{
+					Body: prShared.EditableString{
+						Value:  "test",
+						Edited: true,
+					},
+				},
+			},
+			wantsErr: false,
+		},
+		{
+			name:  "prefer_editor_prompt config with body-file flag",
+			input: fmt.Sprintf("23 --body-file '%s'", tmpFile),
+			config: func() (gh.Config, error) {
+				return config.NewFromString("prefer_editor_prompt: enabled"), nil
+			},
+			output: EditOptions{
+				IssueNumbers: []int{23},
+				EditorMode:   false,
+				Editable: prShared.Editable{
+					Body: prShared.EditableString{
+						Value:  "a body from file",
+						Edited: true,
+					},
+				},
+			},
+			wantsErr: false,
+		},
+		{
+			name:  "prefer_editor_prompt config with multiple issues and label",
+			input: "23 34 --add-label bug",
+			config: func() (gh.Config, error) {
+				return config.NewFromString("prefer_editor_prompt: enabled"), nil
+			},
+			output: EditOptions{
+				IssueNumbers: []int{23, 34},
+				EditorMode:   false,
+				Editable: prShared.Editable{
+					Labels: prShared.EditableSlice{
+						Add:    []string{"bug"},
+						Edited: true,
+					},
+				},
+			},
+			wantsErr: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -293,8 +374,16 @@ func TestNewCmdEdit(t *testing.T) {
 				_, _ = stdin.WriteString(tt.stdin)
 			}
 
+			cfgFunc := tt.config
+			if cfgFunc == nil {
+				cfgFunc = func() (gh.Config, error) {
+					return config.NewBlankConfig(), nil
+				}
+			}
+
 			f := &cmdutil.Factory{
 				IOStreams: ios,
+				Config:    cfgFunc,
 			}
 
 			argv, err := shlex.Split(tt.input)
@@ -321,6 +410,7 @@ func TestNewCmdEdit(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tt.output.IssueNumbers, gotOpts.IssueNumbers)
 			assert.Equal(t, tt.output.Interactive, gotOpts.Interactive)
+			assert.Equal(t, tt.output.EditorMode, gotOpts.EditorMode)
 			assert.Equal(t, tt.output.Editable, gotOpts.Editable)
 			if tt.expectedBaseRepo != nil {
 				baseRepo, err := gotOpts.BaseRepo()
@@ -342,7 +432,7 @@ func Test_editRun(t *testing.T) {
 		httpStubs func(*testing.T, *httpmock.Registry)
 		stdout    string
 		stderr    string
-		wantErr   bool
+		wantErr   string
 	}{
 		{
 			name: "non-interactive",
@@ -502,7 +592,7 @@ func Test_editRun(t *testing.T) {
 						] }`),
 				)
 			},
-			wantErr: true,
+			wantErr: "*",
 		},
 		{
 			name: "non-interactive multiple issues with update failures",
@@ -572,7 +662,7 @@ func Test_editRun(t *testing.T) {
 				https://github.com/OWNER/REPO/issue/123
 			`),
 			stderr:  `failed to update https://github.com/OWNER/REPO/issue/456:.*test error`,
-			wantErr: true,
+			wantErr: "*",
 		},
 		{
 			name: "interactive",
@@ -613,6 +703,59 @@ func Test_editRun(t *testing.T) {
 				mockProjectV2ItemUpdate(t, reg)
 			},
 			stdout: "https://github.com/OWNER/REPO/issue/123\n",
+		},
+		{
+			name: "editor mode",
+			input: &EditOptions{
+				Detector:     &fd.EnabledDetectorMock{},
+				IssueNumbers: []int{123},
+				EditorMode:   true,
+				TitledEditSurvey: func(title, body string) (string, string, error) {
+					return "edited title", "edited body", nil
+				},
+				FieldsToEditSurvey: func(p prShared.EditPrompter, eo *prShared.Editable) error {
+					t.Fatal("FieldsToEditSurvey should not be called in editor mode")
+					return nil
+				},
+				EditFieldsSurvey: func(p prShared.EditPrompter, eo *prShared.Editable, _ string) error {
+					t.Fatal("EditFieldsSurvey should not be called in editor mode")
+					return nil
+				},
+				FetchOptions: func(client *api.Client, repo ghrepo.Interface, editable *prShared.Editable, v1 gh.ProjectsV1Support) error {
+					return nil
+				},
+			},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockIssueGet(t, reg)
+				reg.Register(
+					httpmock.GraphQL(`mutation IssueUpdate\b`),
+					httpmock.GraphQLMutation(`
+					{ "data": { "updateIssue": { "__typename": "" } } }`,
+						func(inputs map[string]interface{}) {
+							assert.Equal(t, "edited title", inputs["title"])
+							assert.Equal(t, "edited body", inputs["body"])
+						}),
+				)
+			},
+			stdout: "https://github.com/OWNER/REPO/issue/123\n",
+		},
+		{
+			name: "editor mode empty title",
+			input: &EditOptions{
+				Detector:     &fd.EnabledDetectorMock{},
+				IssueNumbers: []int{123},
+				EditorMode:   true,
+				TitledEditSurvey: func(title, body string) (string, string, error) {
+					return "", "", nil
+				},
+				FetchOptions: func(client *api.Client, repo ghrepo.Interface, editable *prShared.Editable, v1 gh.ProjectsV1Support) error {
+					return nil
+				},
+			},
+			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
+				mockIssueGet(t, reg)
+			},
+			wantErr: "title can't be blank",
 		},
 		{
 			name: "interactive prompts with actor assignee display names when actors available",
@@ -740,8 +883,11 @@ func Test_editRun(t *testing.T) {
 			tt.input.BaseRepo = baseRepo
 
 			err := editRun(tt.input)
-			if tt.wantErr {
-				assert.Error(t, err)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				if tt.wantErr != "*" {
+					assert.Contains(t, err.Error(), tt.wantErr)
+				}
 			} else {
 				assert.NoError(t, err)
 			}
