@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -442,6 +443,93 @@ type tinyConfig map[string]string
 
 func (c tinyConfig) ActiveToken(host string) (string, string) {
 	return c[fmt.Sprintf("%s:%s", host, "oauth_token")], "oauth_token"
+}
+
+func (c tinyConfig) ActiveTokenWithError(host string) (string, string, error) {
+	token, source := c.ActiveToken(host)
+	return token, source, nil
+}
+
+// resolvingTokenConfig is a tokenGetter that lets a test inject both the
+// resolved token and the resolution error. It covers (a) keyring failures
+// surfaced as request-level errors, (b) successful resolution through the
+// error-aware path, and (c) the empty-token-no-error anonymous case.
+type resolvingTokenConfig struct {
+	token string
+	err   error
+}
+
+func (c resolvingTokenConfig) ActiveToken(host string) (string, string) {
+	return c.token, ""
+}
+
+func (c resolvingTokenConfig) ActiveTokenWithError(host string) (string, string, error) {
+	return c.token, "", c.err
+}
+
+// TestAddAuthTokenHeaderResolutionPaths verifies the three outcomes of
+// token resolution at request time: an error fails the request loudly,
+// a resolved token is attached as Authorization, and an empty token with
+// no error proceeds anonymously (preserving support for unauthenticated
+// endpoints like /zen).
+func TestAddAuthTokenHeaderResolutionPaths(t *testing.T) {
+	resolutionErr := errors.New("simulated keyring failure")
+
+	tests := []struct {
+		name            string
+		cfg             resolvingTokenConfig
+		wantErr         error
+		wantInnerCalled bool
+		wantAuthHeader  string
+	}{
+		{
+			name:            "resolution error fails the request",
+			cfg:             resolvingTokenConfig{err: resolutionErr},
+			wantErr:         resolutionErr,
+			wantInnerCalled: false,
+		},
+		{
+			name:            "resolved token is attached as Authorization",
+			cfg:             resolvingTokenConfig{token: "RESOLVED-TOKEN"},
+			wantInnerCalled: true,
+			wantAuthHeader:  "token RESOLVED-TOKEN",
+		},
+		{
+			name:            "empty token with no error proceeds anonymously",
+			cfg:             resolvingTokenConfig{},
+			wantInnerCalled: true,
+			wantAuthHeader:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var innerCalled bool
+			var captured *http.Request
+			inner := funcTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
+				innerCalled = true
+				captured = req
+				return &http.Response{StatusCode: http.StatusOK}, nil
+			}}
+
+			rt := AddAuthTokenHeader(inner, tt.cfg)
+
+			req, err := http.NewRequest("GET", "https://api.github.com/", nil)
+			require.NoError(t, err)
+
+			_, err = rt.RoundTrip(req)
+			if tt.wantErr != nil {
+				require.ErrorIs(t, err, tt.wantErr)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantInnerCalled, innerCalled)
+			if tt.wantInnerCalled {
+				require.NotNil(t, captured)
+				assert.Equal(t, tt.wantAuthHeader, captured.Header.Get("Authorization"))
+			}
+		})
+	}
 }
 
 var requestAtRE = regexp.MustCompile(`(?m)^\* Request at .+`)
