@@ -48,7 +48,7 @@ func NewCmdEdit(f *cmdutil.Factory, runF func(*EditOptions) error) *cobra.Comman
 	}
 
 	cmd := &cobra.Command{
-		Use:   "edit {<number> | <url>}",
+		Use:   "edit {<number> | <discussion-url>} [flags]",
 		Short: "Edit a discussion (preview)",
 		Long: heredoc.Doc(`
 			Edit a GitHub Discussion.

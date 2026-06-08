@@ -36,19 +36,19 @@ jq-assert VIEW_JSON '.body' 'Discussion body content'
 jq-assert VIEW_JSON '.labels[0].name' 'bug'
 jq-assert VIEW_JSON '.labels[1].name' 'enhancement'
 
-# Get the discussion node ID for adding comments via API
-jq2env VIEW_JSON '.id' DISCUSSION_ID
+# Add two comments using the comment command
+exec gh discussion comment $DISCUSSION_URL --body 'First comment body'
+exec gh discussion comment $DISCUSSION_URL --body 'Second comment body'
 
-# Add two comments via API
-exec gh api graphql -f query='mutation { addDiscussionComment(input: {discussionId: "'$DISCUSSION_ID'", body: "First comment body"}) { comment { id } } }' --jq '.data.addDiscussionComment.comment.id'
-stdout2env COMMENT1_ID
-
-exec gh api graphql -f query='mutation { addDiscussionComment(input: {discussionId: "'$DISCUSSION_ID'", body: "Second comment body"}) { comment { id } } }' --jq '.data.addDiscussionComment.comment.id'
-stdout2env COMMENT2_ID
+# Get comment IDs for reply tests
+exec gh discussion view $DISCUSSION_URL --comments --order oldest --json comments
+stdout2env COMMENTS_JSON
+jq2env COMMENTS_JSON '.comments.nodes[0].id' COMMENT1_ID
+jq2env COMMENTS_JSON '.comments.nodes[1].id' COMMENT2_ID
 
 # Add replies to the first comment
-exec gh api graphql -f query='mutation { addDiscussionComment(input: {discussionId: "'$DISCUSSION_ID'", replyToId: "'$COMMENT1_ID'", body: "Reply one to first"}) { comment { id } } }'
-exec gh api graphql -f query='mutation { addDiscussionComment(input: {discussionId: "'$DISCUSSION_ID'", replyToId: "'$COMMENT1_ID'", body: "Reply two to first"}) { comment { id } } }'
+exec gh discussion comment $COMMENT1_ID --body 'Reply one to first'
+exec gh discussion comment $COMMENT1_ID --body 'Reply two to first'
 
 # View with --comments in non-interactive mode
 exec gh discussion view $DISCUSSION_URL --comments
@@ -114,3 +114,11 @@ jq-assert RPAGE2_JSON '.comments.nodes[0].replies.nodes | length' '^1$'
 jq-assert RPAGE2_JSON '.comments.nodes[0].replies.nodes[0].body' 'Reply two to first'
 jq-assert RPAGE2_JSON '.comments.nodes[0].replies.cursor' '.+'
 jq-assert RPAGE2_JSON '.comments.nodes[0].replies | has("next")' 'false'
+
+# Test --replies with a comment URL instead of node ID
+jq2env COMMENTS_JSON '.comments.nodes[0].url' COMMENT1_URL
+exec gh discussion view $DISCUSSION_URL --replies $COMMENT1_URL --order oldest --json comments
+stdout2env URL_REPLIES_JSON
+jq-assert URL_REPLIES_JSON '.comments.nodes[0].replies.nodes | length' '^2$'
+jq-assert URL_REPLIES_JSON '.comments.nodes[0].replies.nodes[0].body' 'Reply one to first'
+jq-assert URL_REPLIES_JSON '.comments.nodes[0].replies.nodes[1].body' 'Reply two to first'
